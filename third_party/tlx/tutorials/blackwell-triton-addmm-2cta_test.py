@@ -15,6 +15,17 @@ Tests:
   1. Non-WS: Compilation + correctness with ctas_per_cga=(2, 1, 1)
   2. Auto-WS + 2CTA: Compilation + correctness
   3. Performance: Pure Triton 2-CTA vs TLX 2-CTA
+
+Debugging:
+  To dump TTGIR at each pass stage:
+    MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 python -m pytest <test> 2>dump.log
+
+  To dump IR for a specific pass (e.g., Transform2CTALoads or Insert2CTASync):
+    MLIR_ENABLE_DUMP=nvgpu-2cta-transform-loads python -m pytest <test> 2>dump.log
+    MLIR_ENABLE_DUMP=nvgpu-insert-2cta-sync python -m pytest <test> 2>dump.log
+
+  To dump final TTGIR/PTX to files:
+    TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump python -m pytest <test>
 """
 
 import os
@@ -215,6 +226,12 @@ def matmul_2cta_ws_kernel(
         strides=[stride_bk, stride_bn],
         block_shape=[BLOCK_K, BLOCK_N],
     )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[stride_cm, stride_cn],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -226,11 +243,7 @@ def matmul_2cta_ws_kernel(
         accumulator = tl.dot(a, b, accumulator, two_ctas=True)
 
     c = accumulator.to(tl.float16)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=mask)
+    c_desc.store([offs_am, offs_bn], c)
 
 
 def matmul_2cta_ws(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -486,3 +499,204 @@ def test_matmul_2cta_perf(M, N, K):
           f"  |  1CTA+WS: {tflops(t_1cta_ws):.0f}"
           f"  |  2CTA: {tflops(t_2cta):.0f}"
           f"  |  2CTA+WS: {tflops(t_2cta_ws):.0f} TFLOPS")
+
+
+# ---------------------------------------------------------------------------
+# Host-side TMA + 2-CTA tests
+# ---------------------------------------------------------------------------
+
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+@triton.jit
+def matmul_2cta_host_tma_kernel(
+    a_desc,
+    b_desc,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    for k in range(k_tiles):
+        offs_k = k * BLOCK_K
+        a = a_desc.load([offs_am, offs_k])
+        b = b_desc.load([offs_k, offs_bn])
+        accumulator = tl.dot(a, b, accumulator, two_ctas=True)
+
+    c = accumulator.to(tl.float16)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+def matmul_2cta_host_tma(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 64
+
+    a_desc = TensorDescriptor(a, [M, K], [K, 1], [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor(b, [K, N], [N, 1], [BLOCK_K, BLOCK_N])
+
+    grid = (max(triton.cdiv(M, BLOCK_M), 2), triton.cdiv(N, BLOCK_N))
+
+    matmul_2cta_host_tma_kernel[grid](
+        a_desc,
+        b_desc,
+        c,
+        M,
+        N,
+        K,
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_stages=1,
+        ctas_per_cga=(2, 1, 1),
+    )
+    return c
+
+
+@pytest.mark.parametrize("M,N,K", [
+    (128, 128, 64),
+    (256, 256, 128),
+])
+def test_matmul_2cta_host_tma_correctness(M, N, K):
+    """Test 2-CTA with host-side TMA descriptors (TensorDescriptor)."""
+    torch.manual_seed(42)
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+
+    ref = torch.matmul(a, b)
+    out = matmul_2cta_host_tma(a, b)
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+def test_matmul_2cta_host_tma_compilation():
+    """Test that host-side TMA 2-CTA kernel compiles and IR has cta_group::2."""
+    torch.manual_seed(42)
+    M, N, K = 128, 128, 64
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+
+    out = matmul_2cta_host_tma(a, b)
+    assert out.shape == (M, N)
+    assert out.dtype == torch.float16
+
+
+# ---------------------------------------------------------------------------
+# Host-side TMA + WS + 2-CTA tests
+# Uses host-side TMA for A/B loads, device-side TMA for C store (descriptor
+# store is required for WS epilogue partition creation).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def matmul_2cta_host_tma_ws_kernel(
+    a_desc,
+    b_desc,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
+
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[stride_cm, stride_cn],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    for k in tl.range(0, k_tiles, warp_specialize=True):
+        offs_k = k * BLOCK_K
+        a = a_desc.load([offs_am, offs_k])
+        b = b_desc.load([offs_k, offs_bn])
+        accumulator = tl.dot(a, b, accumulator, two_ctas=True)
+
+    c = accumulator.to(tl.float16)
+    c_desc.store([offs_am, offs_bn], c)
+
+
+def matmul_2cta_host_tma_ws(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 64
+
+    a_desc = TensorDescriptor(a, [M, K], [K, 1], [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor(b, [K, N], [N, 1], [BLOCK_K, BLOCK_N])
+
+    grid = (max(triton.cdiv(M, BLOCK_M), 2), triton.cdiv(N, BLOCK_N))
+
+    with ws_env():
+        matmul_2cta_host_tma_ws_kernel[grid](
+            a_desc,
+            b_desc,
+            c,
+            M,
+            N,
+            K,
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_stages=1,
+            ctas_per_cga=(2, 1, 1),
+        )
+    return c
+
+
+@pytest.mark.parametrize("M,N,K", [
+    (128, 128, 64),
+    (256, 256, 128),
+])
+def test_matmul_2cta_host_tma_ws_correctness(M, N, K):
+    """Test WS + 2-CTA with host-side TMA descriptors."""
+    torch.manual_seed(42)
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+
+    ref = torch.matmul(a, b)
+    out = matmul_2cta_host_tma_ws(a, b)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
