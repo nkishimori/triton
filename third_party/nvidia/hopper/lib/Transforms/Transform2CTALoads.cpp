@@ -138,15 +138,8 @@ struct Transform2CTALoads
     if (!descLoad)
       return failure();
 
-    // Find the MakeTensorDescOp that created the descriptor.
-    auto makeDesc = descLoad.getDesc().getDefiningOp<tt::MakeTensorDescOp>();
-    if (!makeDesc) {
-      LDBG("B descriptor is not from MakeTensorDescOp, skipping");
-      return failure();
-    }
-
-    // Get block shape from descriptor type.
-    auto descType = cast<tt::TensorDescType>(makeDesc.getType());
+    // Get block shape from the descriptor's type.
+    auto descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
     auto blockShape = descType.getBlockType().getShape();
     assert(blockShape.size() == 2 && "Expected 2D block shape");
     int64_t blockK = blockShape[0];
@@ -161,22 +154,44 @@ struct Transform2CTALoads
 
     MLIRContext *ctx = mma.getContext();
     auto elemType = descType.getBlockType().getElementType();
-
-    // --- Step 1: Clone MakeTensorDescOp with half-width block shape ---
-    OpBuilder builder(makeDesc);
-    IRMapping mapper;
-    auto *clonedOp = builder.clone(*makeDesc.getOperation(), mapper);
-    auto newMakeDesc = cast<tt::MakeTensorDescOp>(clonedOp);
-
-    // Change result type to half-width descriptor.
-    auto halfBlockType = RankedTensorType::get({blockK, halfN}, elemType);
+    auto blockEncoding = descType.getBlockType().getEncoding();
+    auto halfBlockType = RankedTensorType::get({blockK, halfN}, elemType,
+                                               blockEncoding);
     auto newDescType = tt::TensorDescType::get(ctx, halfBlockType);
-    newMakeDesc.getResult().setType(newDescType);
+
+    // --- Step 1: Create half-width descriptor ---
+    Value newDesc;
+    auto makeDesc = descLoad.getDesc().getDefiningOp<tt::MakeTensorDescOp>();
+    if (makeDesc) {
+      // Device-side TMA: clone MakeTensorDescOp with half-width block shape.
+      OpBuilder descBuilder(makeDesc);
+      IRMapping mapper;
+      auto *clonedOp = descBuilder.clone(*makeDesc.getOperation(), mapper);
+      auto newMakeDesc = cast<tt::MakeTensorDescOp>(clonedOp);
+      newMakeDesc.getResult().setType(newDescType);
+      newDesc = newMakeDesc.getResult();
+    } else {
+      // Host-side TMA: the descriptor is a function argument. Update its type
+      // to half-width block shape. The runtime (getTensorDescMetadata +
+      // fillTMADescriptorTiled) reads the block shape from the final IR type
+      // and creates the CuTensorMap with the correct half-width box_dim.
+      // This follows the same pattern as Data Partitioning (WSDataPartition).
+      auto descVal = descLoad.getDesc();
+      descVal.setType(newDescType);
+      newDesc = descVal;
+      // Update the function signature to match.
+      if (auto funcOp = descLoad->getParentOfType<triton::FuncOp>()) {
+        auto &entryBlock = funcOp.getBlocks().front();
+        SmallVector<Type> argTys(entryBlock.getArgumentTypes());
+        funcOp.setFunctionType(FunctionType::get(
+            ctx, argTys, funcOp.getFunctionType().getResults()));
+      }
+    }
 
     LDBG("Created half-width descriptor: " << blockK << "x" << halfN);
 
     // --- Step 2: Compute CTA-based offset ---
-    builder.setInsertionPoint(descLoad);
+    OpBuilder builder(descLoad);
     Location loc = descLoad.getLoc();
     auto i32Ty = builder.getI32Type();
 
@@ -201,7 +216,7 @@ struct Transform2CTALoads
         RankedTensorType::get({blockK, halfN}, elemType, newEncoding);
 
     auto newDescLoad = tt::DescriptorLoadOp::create(
-        builder, loc, halfResultType, newMakeDesc.getResult(), newIndices);
+        builder, loc, halfResultType, newDesc, newIndices);
     // Mark as a 2-CTA B-operand load so WS passes can identify it
     // without complex value tracing through pipeline buffers.
     newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());
@@ -226,8 +241,8 @@ struct Transform2CTALoads
     if (descLoad.getResult().use_empty())
       descLoad.erase();
 
-    // Clean up old MakeTensorDescOp if no other users.
-    if (makeDesc.getResult().use_empty())
+    // Clean up old MakeTensorDescOp if no other users (device-side only).
+    if (makeDesc && makeDesc.getResult().use_empty())
       makeDesc.erase();
 
     LDBG("Transformed B load for 2-CTA MMA at " << mma.getLoc());

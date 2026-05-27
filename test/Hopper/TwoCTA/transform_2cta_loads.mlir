@@ -84,6 +84,71 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+// Test: Host-side TMA descriptor (function argument) with 2-CTA.
+// The pass should update the argument's TensorDescType to half-width and
+// transform the load, same as device-side but without cloning MakeTensorDescOp.
+// CHECK-LABEL: @matmul_2cta_host_tma
+// The function argument type should be updated to half-width
+// CHECK-SAME: !tt.tensordesc<tensor<64x64xf16>>
+// CTA offset computation
+// CHECK: %[[CTA_ID:.*]] = nvg.cluster_id
+// CHECK: arith.remsi
+// CHECK: arith.muli
+// CHECK: arith.addi
+// Half-width B load
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>>
+// CHECK: ttg.local_alloc %{{.*}} : {{.*}} -> !ttg.memdesc<64x64xf16
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+
+#blocked_h = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1_h = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3_h = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared_h = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem_h = #ttg.shared_memory
+#tmem_h = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_host_tma(
+      %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
+      %b_desc: !tt.tensordesc<tensor<64x128xf16>>) attributes {noinline = false} {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked_h>
+
+    %pid = tt.get_program_id x : i32
+    %offs_am = arith.muli %pid, %c128_i32 : i32
+    %offs_bn = arith.muli %pid, %c128_i32 : i32
+
+    %accumulator = scf.for %k = %c0_i32 to %c1_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked_h>) : i32 {
+      %offs_k = arith.muli %k, %c64_i32 : i32
+
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1_h>
+      %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_h>) -> !ttg.memdesc<128x64xf16, #shared_h, #smem_h>
+
+      // Host-side B descriptor — pass should update the func arg type to half-width
+      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_h>
+      %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked1_h>) -> !ttg.memdesc<64x128xf16, #shared_h, #smem_h>
+
+      %acc_layout = ttg.convert_layout %acc : tensor<128x128xf32, #blocked_h> -> tensor<128x128xf32, #blocked3_h>
+      %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x128xf32, #blocked3_h>) -> (!ttg.memdesc<128x128xf32, #tmem_h, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+      %mma_token = ttng.tc_gen5_mma %a_smem, %b_smem, %acc_tmem[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_h, #smem_h>, !ttg.memdesc<64x128xf16, #shared_h, #smem_h>, !ttg.memdesc<128x128xf32, #tmem_h, #ttng.tensor_memory, mutable>
+
+      %result, %load_token = ttng.tmem_load %acc_tmem[%mma_token] : !ttg.memdesc<128x128xf32, #tmem_h, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked3_h>
+      %result_layout = ttg.convert_layout %result : tensor<128x128xf32, #blocked3_h> -> tensor<128x128xf32, #blocked_h>
+
+      scf.yield %result_layout : tensor<128x128xf32, #blocked_h>
+    }
+
+    tt.return
+  }
+}
+
+// -----
+
 // Test: No two_ctas attribute - pass should not modify anything
 // CHECK-LABEL: @matmul_no_2cta
 // CHECK-NOT: nvg.cluster_id
