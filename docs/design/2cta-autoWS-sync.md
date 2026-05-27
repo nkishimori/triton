@@ -91,19 +91,83 @@ The user writes standard Triton code with two additions:
 
 ```python
 @triton.jit
-def matmul_2cta(a_ptr, b_ptr, c_ptr, M, N, K, ...):
-    # Standard TMA descriptor loads (full B)
-    a_desc = tl.make_tensor_descriptor(a_ptr, [M, K], ..., [BLOCK_M, BLOCK_K])
-    b_desc = tl.make_tensor_descriptor(b_ptr, [K, N], ..., [BLOCK_K, BLOCK_N])
+def matmul_2cta(
+    a_ptr,         # [M, K] input matrix
+    b_ptr,         # [K, N] input matrix
+    c_ptr,         # [M, N] output matrix
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
 
+    # Device-side TMA descriptors
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr, shape=[M, K], strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr, shape=[M, N], strides=[stride_cm, stride_cn],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    k_tiles = tl.cdiv(K, BLOCK_K)
     for k in range(k_tiles):
+        offs_k = k * BLOCK_K
         a = a_desc.load([offs_am, offs_k])
         b = b_desc.load([offs_k, offs_bn])  # Full B — compiler splits this
-        acc = tl.dot(a, b, acc, two_ctas=True)
+        accumulator = tl.dot(a, b, accumulator, two_ctas=True)
 
-# Launch with ctas_per_cga — bypasses PlanCTA
-matmul_2cta[grid](..., ctas_per_cga=(2, 1, 1))
+    c = accumulator.to(tl.float16)
+    c_desc.store([offs_am, offs_bn], c)
+
+# Launch with ctas_per_cga=(2,1,1) — bypasses PlanCTA
+grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+matmul_2cta[grid](
+    a, b, c,
+    M, N, K,
+    a.stride(0), a.stride(1),
+    b.stride(0), b.stride(1),
+    c.stride(0), c.stride(1),
+    BLOCK_M=128,
+    BLOCK_N=128,
+    BLOCK_K=64,
+    ctas_per_cga=(2, 1, 1),
+)
 ```
+
+### Supported Configurations
+
+| Configuration | Status |
+|---|---|
+| `two_ctas=True` + `ctas_per_cga=(2,1,1)` | **Supported** |
+| `two_ctas=True` without `ctas_per_cga` | **Error** — no cluster, MMA would be 1-CTA |
+| `two_ctas=True` + `ctas_per_cga=(4,1,1)` | **Future work** — even-X CGA should work in principle |
+| `two_ctas=True` + `ctas_per_cga=(2,2,1)` | **Unsupported** — Y/Z must be 1 |
+| Mixed `two_ctas` per dot in same kernel | **Impossible** — hardware requires all tcgen05 ops use same `cta_group` |
+
+### Hardware Constraint: Consistent `cta_group`
+
+The PTX ISA mandates:
+
+> "All tcgen05 instructions in a kernel **must** use the same `.cta_group` value."
+
+This means a kernel cannot selectively enable 2-CTA on some dots but not others
+(e.g., FA with 2-CTA on the main GEMM but 1-CTA on softmax). It must be all or
+nothing. This is enforced at compile time by `CheckMatmulTwoCTAs`, which emits an
+error if any MMA ops disagree on `two_ctas`.
 
 The `two_ctas` attribute flows through:
 
@@ -160,8 +224,12 @@ mma.setTwoCtas(useTwoCTAs);  // Propagates to TCGen5MMAOp
 This pass runs before pipelining/WS and transforms B descriptor loads for non-async
 (non-TLX) 2-CTA MMAs. For each `TCGen5MMAOp` with `two_ctas=true && !is_async`:
 
-1. **Trace B operand** back through `LocalAllocOp` → `DescriptorLoadOp` → `MakeTensorDescOp`
-2. **Clone `MakeTensorDescOp`** with half-width block shape: `[BLOCK_K, BLOCK_N]` → `[BLOCK_K, BLOCK_N/2]`
+1. **Trace B operand** back through `LocalAllocOp` → `DescriptorLoadOp` → descriptor source
+2. **Create half-width descriptor** (depends on descriptor source):
+   - **Device-side TMA** (`MakeTensorDescOp`): clone the op with half-width block
+     shape `[BLOCK_K, BLOCK_N/2]`
+   - **Host-side TMA** (function argument): mutate the argument's `TensorDescType`
+     to half-width block shape and update the `FuncOp` signature (see below)
 3. **Insert CTA offset computation**:
    ```
    cta_rank = nvgpu.cluster_id
@@ -171,6 +239,18 @@ This pass runs before pipelining/WS and transforms B descriptor loads for non-as
    ```
 4. **Create new `DescriptorLoadOp`** with half-width result type and new descriptor
 5. **Create new `LocalAllocOp`** with half-width SMEM memdesc
+
+#### Host-Side TMA Support
+
+For host-side TMA descriptors (passed as kernel function arguments), the pass
+updates the argument's `TensorDescType` in-place from `tensor<KxNxf16>` to
+`tensor<Kx(N/2)xf16>` and rebuilds the `FuncOp` type signature to match. This
+follows the same pattern as Data Partitioning (`WSDataPartition.cpp`).
+
+The runtime infrastructure handles the rest automatically:
+1. `getTensorDescMetadata()` reads the block shape from the final IR type
+2. The Python runtime calls `cuTensorMapEncodeTiled()` with the half-width `box_dim`
+3. No runtime-side changes are needed
 
 After this transform:
 - CTA 0 loads `B[:, offs_bn : offs_bn + BLOCK_N/2]`
@@ -354,15 +434,19 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    barrier. Works for pipeline depth <= 2; may need multi-buffered barriers for
    deeper pipelines.
 
-2. **Multiple MMAs per loop iteration**: Shared single barrier; could cause phase
-   conflicts if they overlap. Future: allocate separate barriers per MMA.
+2. **Multiple MMAs per loop iteration**: Only one 2-CTA MMA per loop iteration is
+   supported. Multiple MMAs would require separate barriers (one per MMA) to avoid
+   phase conflicts. The compiler asserts if multiple 2-CTA MMAs are detected in
+   the same loop. FA support is future work.
 
 3. **TCGen5MMAScaledOp**: Only `TCGen5MMAOp` is handled; the scaled variant is
    not yet supported.
 
-4. **B from function arguments**: `Transform2CTALoads` requires B's descriptor to
-   come from `MakeTensorDescOp` (not a function argument). This covers all real
-   kernels where `make_tensor_descriptor` is called in the kernel body.
+4. **B from function arguments**: `Transform2CTALoads` supports both device-side
+   TMA (`MakeTensorDescOp`) and host-side TMA (function argument descriptors).
+   For host-side descriptors, the pass updates the argument's `TensorDescType`
+   to half-width block shape; the runtime reads the final IR type via
+   `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
 
 5. **Encoding compatibility**: When halving the N dimension, the blocked encoding
    on the descriptor load result may need adjustment. The pass computes a
@@ -372,6 +456,19 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    support for TMA loads, which routes barrier arrivals to the leader CTA in
    hardware. A future optimization could use this on B-operand TMA loads,
    potentially eliminating the explicit cross-CTA sync.
+
+7. **Even `num_tiles` requirement**: In 2-CTA mode, CTAs launch in pairs. If
+   `num_tiles` is odd, the last CTA has no partner, which could cause a hang on
+   the cross-CTA barrier or produce incorrect results. TLX kernels filter configs
+   manually for this. The compiler does not currently enforce this constraint.
+
+8. **CGA sizes beyond `(2,1,1)`**: `two_ctas=True` should be compatible with any
+   even-sized CGA-X (e.g., `ctas_per_cga=(4,1,1)`) in the future. Requiring
+   Y/Z == 1 is reasonable. Extending beyond `(2,1,1)` is future work.
+
+9. **Mixed 2-CTA per kernel**: The PTX ISA requires all tcgen05 instructions use
+   the same `cta_group`. FA with selective 2-CTA on only some dots is impossible.
+   A kernel must use 2-CTA on all dots or none.
 
 ---
 
@@ -399,6 +496,111 @@ Insert2CTASync          ← cross-CTA sync (AFTER all WS passes to avoid interfe
 interference. The barrier ops won't be reordered or erased by subsequent WS passes.
 `getThreadId()` returns relative IDs inside `WarpSpecializeOp` partition regions,
 so `InitBarrierOp` and `ArriveBarrierOp` work correctly in the consumer warp group.
+
+### Synchronization Rules
+
+There are **two independent barrier systems** in a 2-CTA auto-WS kernel:
+
+1. **WS pipeline barriers** (per-CTA, managed by WSCodePartition)
+2. **Cross-CTA sync barriers** (cluster-wide, managed by Insert2CTASync)
+
+These do not interact — they are allocated separately, have separate arrive/wait
+pairs, and serve different purposes.
+
+#### WS Pipeline Barriers (per-CTA)
+
+Each CTA has its own local SMEM barriers for the producer-consumer pipeline:
+
+```
+Producer (load partition)          Consumer (gemm partition)
+─────────────────────────          ─────────────────────────
+TMA load B_half into SMEM          wait b_full
+  → arrive b_full                  MMA reads B_half from local SMEM
+                                   tcgen05.commit
+wait b_empty                         → arrive b_empty (B SMEM is free)
+overwrite B_half buffer
+```
+
+In 2-CTA mode, `Transform2CTALoads` splits B so each CTA loads only half:
+- CTA 0 loads `B[:, 0:N/2]` into CTA 0's SMEM
+- CTA 1 loads `B[:, N/2:N]` into CTA 1's SMEM
+
+Each CTA runs its own independent WS pipeline with local barriers. CTA 0's
+`b_full`/`b_empty` barriers are in CTA 0's SMEM; CTA 1's are in CTA 1's SMEM.
+They never cross CTA boundaries.
+
+**A and B may share a barrier** via `groupChannels()` in WSCodePartition. When both
+A and B loads feed the same MMA with the same taskIds, they merge into one
+`CommChannel` with a shared mbarrier. `BarrierExpectOp` sums the expected bytes
+from both TMA loads. In 2-CTA mode, B is half-width per CTA, so the expected byte
+count reflects the half-width load (not full-width).
+
+#### Cross-CTA Sync Barriers (Insert2CTASync)
+
+Before each 2-CTA MMA, both CTAs must confirm that their B halves are loaded.
+The `tcgen05.mma.cta_group::2` instruction reads A from CTA 0's SMEM and B from
+**both** CTAs' SMEM, so CTA 0 must know CTA 1's B is ready.
+
+`Insert2CTASync` inserts a dedicated cross-CTA barrier with `arriveCount=2`:
+
+```
+CTA 0 (leader)                     CTA 1
+──────────────                     ──────
+leaderRank = ctaRank & ~1          leaderRank = ctaRank & ~1
+remoteBar = mapa(localBar,         remoteBar = mapa(localBar,
+                 leaderRank)                        leaderRank)
+arrive(remoteBar, count=1)         arrive(remoteBar, count=1)
+wait(localBar, phase)              [no wait — only leader waits]
+tcgen05.mma cta_group::2           tcgen05.mma cta_group::2
+```
+
+Key properties:
+- The barrier is allocated in the **leader CTA's SMEM** with `InitBarrierOp(count=2)`
+- Both CTAs arrive via `MapToRemoteBufferOp` (PTX `mapa` instruction)
+- Only the leader waits (predicated on `ctaRank % 2 == 0`)
+- The barrier is **single-buffered** with `phase = (iv - lb) / step % 2`
+- This barrier is completely separate from the WS pipeline barriers
+
+#### B-Empty Signaling Across CTAs
+
+When the MMA completes, `tcgen05.commit.cta_group::2` fires, which tracks
+completion of all prior `cta_group::2` async tcgen05 ops. Per the PTX ISA,
+this means all inputs (A from CTA 0, B from both CTAs) have been consumed.
+
+Each CTA's WS consumer then signals `b_empty` on its **local** barrier, telling
+its local producer that the local B SMEM buffer is free to overwrite. Since each
+CTA only overwrites its own SMEM, the local `b_empty` is sufficient — CTA 0
+doesn't need to signal CTA 1 or vice versa.
+
+**Open question (pending hardware confirmation):** Does `tcgen05.commit.cta_group::2`
+guarantee that **both** CTAs' SMEM inputs are fully consumed before the arrive-on
+fires? The PTX ISA says it "tracks completion of prior async tcgen05 ops" — we
+interpret "completion" as meaning SMEM is safe to overwrite, but this should be
+confirmed with NVIDIA or Peng/Hongtao.
+
+#### MMA PTX Lowering (MMAv5.cpp)
+
+At LLVM lowering, `twoCTAs=true` (from `getModuleTwoCTAs()`) triggers:
+- `tcgen05.mma.cta_group::2` — both CTAs issue the MMA cooperatively
+- `tcgen05.commit.cta_group::2` — commit tracks both CTAs' ops
+- Instruction descriptor M is doubled (e.g., 64→128 or 128→256)
+- B operand shape is halved (expects Transform2CTALoads already split B)
+- MMA is predicated to CTA 0 only (leader issues the instruction)
+- Commit is predicated to CTA 0 only (prevents double-arrive)
+- In WS mode: cluster sync (ClusterArriveOp) is **skipped** because
+  `Insert2CTASync` provides the mbarrier-based sync instead
+
+#### Entry Cluster Barrier for Worker Warps
+
+In WS mode, worker warps sit in a switch loop and never execute main code.
+If the main code contains `barrier.cluster.arrive/wait`, worker warps must
+still participate or the cluster barrier deadlocks.
+
+`ConvertWarpSpecializeToLLVM.cpp` emits a predicated
+`@!isDefault barrier.cluster.arrive.aligned` at kernel entry for worker warps.
+This is gated on `tlxIsClustered(func) || getModuleTwoCTAs(func)` — covering
+both TLX and autoWS 2-CTA kernels. The arrive-once pattern assumes the main
+code has at most one cluster barrier per kernel invocation.
 
 ### Bugs Fixed for Auto-WS + 2-CTA
 
@@ -453,6 +655,26 @@ Fix: Check `cluster-dim-x >= 2` in addition to `num-ctas`.
 
 The exit cluster barrier (before `return`) was only emitted for TLX kernels.
 Fix: Also emit for auto-WS kernels when `cluster-dim-x >= 2`.
+
+### Known Issue: WS + 2-CTA requires descriptor stores
+
+The Meta WS partition scheduler (`PartitionSchedulingMeta`) only creates an
+epilogue partition when the kernel has descriptor stores (`DescriptorStoreOp`,
+`AsyncTMACopyLocalToGlobalOp`). Pointer-based stores (`tl.store`) are not
+recognized as epilogue ops. Without a separate epilogue partition, the MMA and
+TMEMLoad end up in the same partition (task ID 0), causing an assertion in
+`handleOperandD` (`CodePartitionUtility.cpp`):
+
+```
+Assertion `false && "Unexpected Producer Found"' failed
+```
+
+**Workaround:** WS + 2-CTA test kernels must use TMA descriptor stores
+(`tl.store_tensor_descriptor` / `tt.descriptor_store`) for the output, not
+pointer-based `tl.store`. This matches production kernel patterns.
+
+**Future fix:** Either expand `isEpilogueStoreOp` to recognize pointer stores,
+or handle the same-partition case gracefully in `handleOperandD`.
 
 ### Additional Files Changed for Auto-WS + 2-CTA
 
