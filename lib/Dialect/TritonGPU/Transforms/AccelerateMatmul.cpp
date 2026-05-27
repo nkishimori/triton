@@ -557,8 +557,14 @@ public:
     auto oldBType = dotOp.getB().getType();
     bool useTwoCTAs;
     if (dotOp.getTwoCtas()) {
-      // User-driven 2-CTA (ctas_per_cga): user already partitioned B.
-      // No splitBOperand needed — follows the TLX approach.
+      auto mod = dotOp->getParentOfType<ModuleOp>();
+      auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+      if (clusterDims[0] < 2) {
+        return dotOp.emitError(
+            "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
+            "cluster-dim-x is ")
+               << clusterDims[0];
+      }
       useTwoCTAs = true;
     } else {
       // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a

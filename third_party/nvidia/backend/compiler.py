@@ -649,6 +649,10 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
+        # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
+        # (num_ctas=1), so Transform2CTALoads is the only B splitting path.
+        # Cross-CTA sync is handled separately: Insert2CTASync for Meta WS,
+        # MMAv5.cpp's inline ClusterArriveOp for non-WS.
         if (
             capability // 10 >= 10
             and opt.cluster_dims is not None
@@ -726,13 +730,9 @@ class CUDABackend(BaseBackend):
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
-            # 2-CTA support for Meta WS: Insert cross-CTA sync AFTER all
-            # WS-related passes (pipeline, optimize_partition_warps, etc.).
-            # This avoids scheduling/pipeline interference — the barrier ops
-            # won't be reordered or erased by any subsequent WS pass.
-            # getThreadId() returns relative IDs inside WarpSpecializeOp
-            # partition regions, so InitBarrierOp and ArriveBarrierOp work
-            # correctly in the consumer warp group.
+            # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
+            # Only for Meta WS path — non-WS 2-CTA sync is handled by
+            # MMAv5.cpp's inline ClusterArriveOp.
             if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
