@@ -566,6 +566,12 @@ public:
                << clusterDims[0];
       }
       useTwoCTAs = true;
+      auto retShape = oldRetType.getShape();
+      if (retShape[0] < 128) {
+        return dotOp.emitError(
+            "two_ctas=True with BLOCK_M < 128 is not yet supported; "
+            "m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS");
+      }
     } else {
       // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
       // consistent CTA mode, disabling compiler-driven 2CTA mode for now.

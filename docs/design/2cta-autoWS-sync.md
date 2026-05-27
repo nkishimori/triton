@@ -470,6 +470,11 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    the same `cta_group`. FA with selective 2-CTA on only some dots is impossible.
    A kernel must use 2-CTA on all dots or none.
 
+10. **BLOCK_M < 128 not supported**: When `BLOCK_M < 128`, the TMEM instruction
+    shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS`/`TwoCTA_RHS`
+    instead of `DEFAULT`. The compiler currently emits an error if
+    `two_ctas=True` with `BLOCK_M < 128`.
+
 ---
 
 ## Auto-WS + 2-CTA Integration
