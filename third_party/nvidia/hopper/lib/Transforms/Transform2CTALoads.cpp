@@ -100,16 +100,7 @@ struct Transform2CTALoads
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
-    // Check if any cluster dimension >= 2.
-    bool hasCluster = false;
-    for (auto attr :
-         {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
-      if (auto intAttr = moduleOp->getAttrOfType<IntegerAttr>(attr)) {
-        if (intAttr.getInt() >= 2)
-          hasCluster = true;
-      }
-    }
-    if (!hasCluster)
+    if (!ttng::is2CTA(moduleOp))
       return;
 
     // Collect 2-CTA MMA ops (skip async/TLX-managed).

@@ -128,16 +128,7 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
-    // Check if any cluster dimension >= 2 (needed for 2-CTA).
-    bool hasCluster = false;
-    for (auto attr :
-         {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
-      if (auto intAttr = moduleOp->getAttrOfType<IntegerAttr>(attr)) {
-        if (intAttr.getInt() >= 2)
-          hasCluster = true;
-      }
-    }
-    if (!hasCluster)
+    if (!ttng::is2CTA(moduleOp))
       return;
 
     // Skip TLX kernels — they manage their own cross-CTA sync via
@@ -273,16 +264,7 @@ void doInsert2CTASync(triton::FuncOp funcOp) {
   if (!moduleOp)
     return;
 
-  // Check if any cluster dimension >= 2 (needed for 2-CTA).
-  bool hasCluster = false;
-  for (auto attr :
-       {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
-    if (auto intAttr = moduleOp->getAttrOfType<IntegerAttr>(attr)) {
-      if (intAttr.getInt() >= 2)
-        hasCluster = true;
-    }
-  }
-  if (!hasCluster)
+  if (!ttng::is2CTA(moduleOp))
     return;
 
   // Skip TLX kernels.
