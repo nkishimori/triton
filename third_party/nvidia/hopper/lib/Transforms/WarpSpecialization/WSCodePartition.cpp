@@ -3364,6 +3364,11 @@ void insertAsyncComm(
             builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
                 mmaOp->getLoc(), indexedBarrier, /*pred=*/Value(),
                 /*descs=*/ValueRange{});
+            // Clear loop schedule info after commit creation so subsequent
+            // ops don't inherit stale scheduling metadata from the commit.
+            // Note: intentionally inside if(!replaced) — when replaced=true,
+            // the commit was handled by the reuse-group path which manages
+            // its own schedule info. (From D97387127.)
             builder.clearLoopScheduleInfo();
           }
         }
