@@ -11,10 +11,10 @@
 //   2. Only the leader CTA waits on the barrier
 //   3. Both CTAs issue the 2-CTA MMA (hardware synchronizes execution)
 //
-// Pipeline placement: This pass runs BEFORE the WS pipeline so that
-// WSTaskIdPropagate naturally assigns async_task_id attributes to the
-// cross-CTA sync ops, and WSCodePartition correctly partitions them
-// into the consumer warp group.
+// Pipeline placement: This pass runs AFTER all WS-related passes
+// (pipeline, optimize_partition_warps, hoist_tmem_alloc, etc.) to avoid
+// scheduling/pipeline interference — the barrier ops won't be reordered
+// or erased by subsequent WS passes.
 //
 // Reference: fbcode/generative_recommenders/ops/triton/triton_addmm.py
 
@@ -238,7 +238,8 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
 
         // Capture barrier into WarpSpecializeOp partition regions.
-        wsOp->insertOperands(wsOp->getNumOperands(), barrierAlloc);
+        auto partOp = wsOp.getPartitionOp();
+        partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
         Value capturedBarrier;
         for (Region *region : wsOp.getPartitionRegions()) {
           BlockArgument arg = region->addArgument(barrierAlloc.getType(), loc);
@@ -352,7 +353,8 @@ void doInsert2CTASync(triton::FuncOp funcOp) {
       return barrierAlloc;
 
     // MMA is in a partition region (IsolatedFromAbove): add explicit capture.
-    wsOp->insertOperands(wsOp->getNumOperands(), barrierAlloc);
+    auto partOp = wsOp.getPartitionOp();
+        partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
     Value capturedBarrier;
     for (Region *region : wsOp.getPartitionRegions()) {
       BlockArgument arg = region->addArgument(barrierAlloc.getType(), loc);
