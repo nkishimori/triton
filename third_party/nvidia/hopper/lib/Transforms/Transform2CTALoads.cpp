@@ -1,7 +1,7 @@
 // Transform B matrix descriptor loads for 2-CTA MMA operations.
 //
-// When TCGen5MMAOp has two_ctas=true and is not async (i.e., pure Triton,
-// not TLX), this pass splits B loads so each CTA loads half of B:
+// When non-TLX TCGen5MMAOp has two_ctas=true, this pass splits B loads so each
+// CTA loads half of B:
 //   CTA 0 loads B[:, 0 : BLOCK_N/2]
 //   CTA 1 loads B[:, BLOCK_N/2 : BLOCK_N]
 //
@@ -51,47 +51,96 @@ namespace {
 // If the original encoding's tile size exceeds the new shape in the N
 // dimension, adjust threadsPerWarp to fit.
 static ttg::BlockedEncodingAttr
-getCompatibleEncoding(ttg::BlockedEncodingAttr origEncoding, int64_t M,
-                      int64_t N, MLIRContext *ctx) {
+getCompatibleEncoding(ttg::BlockedEncodingAttr origEncoding,
+                      ArrayRef<int64_t> shape, unsigned splitDim,
+                      MLIRContext *ctx) {
   auto spt = SmallVector<unsigned>(origEncoding.getSizePerThread());
   auto tpw = SmallVector<unsigned>(origEncoding.getThreadsPerWarp());
   auto wpc = SmallVector<unsigned>(origEncoding.getWarpsPerCTA());
   auto order = SmallVector<unsigned>(origEncoding.getOrder());
   auto ctaLayout = origEncoding.getCGALayout();
 
-  unsigned tileN = spt[1] * tpw[1] * wpc[1];
-  if (M % (spt[0] * tpw[0] * wpc[0]) == 0 && N % tileN == 0)
+  bool compatible = true;
+  for (auto dimAndSize : llvm::enumerate(shape)) {
+    unsigned dim = dimAndSize.index();
+    int64_t size = dimAndSize.value();
+    unsigned tile = spt[dim] * tpw[dim] * wpc[dim];
+    compatible &= size % tile == 0;
+  }
+  if (compatible)
     return origEncoding;
 
-  // Reduce N-tile by halving threadsPerWarp[1] and doubling
-  // threadsPerWarp[0] to keep total threads = 32.
-  while (spt[1] * tpw[1] * wpc[1] > static_cast<unsigned>(N) && tpw[1] > 1) {
-    tpw[1] /= 2;
-    tpw[0] *= 2;
+  // Reduce the split dimension's tile size. Move threads to the other
+  // dimension when possible to keep the total threadsPerWarp unchanged.
+  unsigned otherDim = 1 - splitDim;
+  while (spt[splitDim] * tpw[splitDim] * wpc[splitDim] >
+             static_cast<unsigned>(shape[splitDim]) &&
+         tpw[splitDim] > 1) {
+    tpw[splitDim] /= 2;
+    tpw[otherDim] *= 2;
   }
-  // If still too large, reduce sizePerThread[1].
-  while (spt[1] * tpw[1] * wpc[1] > static_cast<unsigned>(N) && spt[1] > 1) {
-    spt[1] /= 2;
+  // If still too large, reduce sizePerThread in the split dimension.
+  while (spt[splitDim] * tpw[splitDim] * wpc[splitDim] >
+             static_cast<unsigned>(shape[splitDim]) &&
+         spt[splitDim] > 1) {
+    spt[splitDim] /= 2;
   }
 
   return ttg::BlockedEncodingAttr::get(ctx, spt, tpw, wpc, order, ctaLayout);
 }
 
-// Trace B operand from MMA back through LocalAllocOp and ConvertLayoutOps
-// to find the DescriptorLoadOp.
-static tt::DescriptorLoadOp
-traceToDescriptorLoad(Value bMemDesc, ttg::LocalAllocOp &outLocalAlloc) {
+struct BLoadTrace {
+  tt::DescriptorLoadOp descLoad;
+  ttg::LocalAllocOp localAlloc;
+  ttg::MemDescTransOp memDescTrans;
+  tt::TransOp trans;
+  unsigned splitDim = 1;
+};
+
+// Trace B operand from MMA back through LocalAllocOp and cheap layout/view ops
+// to find the DescriptorLoadOp. When B is transposed, either before allocation
+// with tt.trans or after allocation with ttg.memdesc_trans, split the
+// descriptor dimension that becomes the MMA N dimension after transpose.
+static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
+  ttg::MemDescTransOp memDescTrans;
+  unsigned splitDim = 1;
+  if (auto transOp = bMemDesc.getDefiningOp<ttg::MemDescTransOp>()) {
+    memDescTrans = transOp;
+    if (memDescTrans.getOrder().size() != 2)
+      return failure();
+    // MMA B's N dimension is result dimension 1. Map it back to the source
+    // descriptor/local_alloc dimension through the memdesc transpose order.
+    splitDim = memDescTrans.getOrder()[1];
+    bMemDesc = memDescTrans.getSrc();
+  }
+
   auto localAlloc = bMemDesc.getDefiningOp<ttg::LocalAllocOp>();
   if (!localAlloc)
-    return nullptr;
-  outLocalAlloc = localAlloc;
+    return failure();
 
   Value tensor = localAlloc.getSrc();
   // Skip convert_layout ops.
   while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
     tensor = cvt.getSrc();
 
-  return tensor.getDefiningOp<tt::DescriptorLoadOp>();
+  tt::TransOp trans;
+  if (auto transOp = tensor.getDefiningOp<tt::TransOp>()) {
+    trans = transOp;
+    if (trans.getOrder().size() != 2)
+      return failure();
+    // MMA B's N dimension is result dimension 1. Map it back to the
+    // descriptor-load source dimension through the transpose order.
+    splitDim = trans.getOrder()[1];
+    tensor = trans.getSrc();
+    while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
+      tensor = cvt.getSrc();
+  }
+
+  auto descLoad = tensor.getDefiningOp<tt::DescriptorLoadOp>();
+  if (!descLoad)
+    return failure();
+
+  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
 }
 
 struct Transform2CTALoads
@@ -103,10 +152,14 @@ struct Transform2CTALoads
     if (!ttng::is2CTA(moduleOp))
       return;
 
-    // Collect 2-CTA MMA ops (skip async/TLX-managed).
+    // TLX kernels manage their own 2-CTA load splitting and synchronization.
+    if (moduleOp->hasAttr("tlx.has_tlx_ops"))
+      return;
+
+    // Collect 2-CTA MMA ops.
     SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
     moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
-      if (mma.getTwoCtas() && !mma.getIsAsync())
+      if (mma.getTwoCtas())
         twoCTAMMAOps.push_back(mma);
     });
 
@@ -124,19 +177,24 @@ struct Transform2CTALoads
 
   LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {
     // Trace B operand back to DescriptorLoadOp.
-    ttg::LocalAllocOp localAlloc;
-    auto descLoad = traceToDescriptorLoad(mma.getB(), localAlloc);
-    if (!descLoad)
+    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(mma.getB());
+    if (failed(trace))
       return failure();
+    auto descLoad = trace->descLoad;
+    auto localAlloc = trace->localAlloc;
+    auto memDescTrans = trace->memDescTrans;
+    auto trans = trace->trans;
+    unsigned splitDim = trace->splitDim;
 
     // Get block shape from the descriptor's type.
     auto descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
     auto blockShape = descType.getBlockType().getShape();
     assert(blockShape.size() == 2 && "Expected 2D block shape");
-    int64_t blockK = blockShape[0];
-    int64_t blockN = blockShape[1];
+    SmallVector<int64_t> newBlockShape(blockShape.begin(), blockShape.end());
+    int64_t blockN = blockShape[splitDim];
     assert(blockN % 2 == 0 && "BLOCK_N must be even for 2-CTA B splitting");
     int64_t halfN = blockN / 2;
+    newBlockShape[splitDim] = halfN;
 
     if (halfN < 16) {
       LDBG("halfN=" << halfN << " too small, skipping");
@@ -146,8 +204,8 @@ struct Transform2CTALoads
     MLIRContext *ctx = mma.getContext();
     auto elemType = descType.getBlockType().getElementType();
     auto blockEncoding = descType.getBlockType().getEncoding();
-    auto halfBlockType = RankedTensorType::get({blockK, halfN}, elemType,
-                                               blockEncoding);
+    auto halfBlockType =
+        RankedTensorType::get(newBlockShape, elemType, blockEncoding);
     auto newDescType = tt::TensorDescType::get(ctx, halfBlockType);
 
     // --- Step 1: Create half-width descriptor ---
@@ -179,7 +237,7 @@ struct Transform2CTALoads
       }
     }
 
-    LDBG("Created half-width descriptor: " << blockK << "x" << halfN);
+    LDBG("Created half-width descriptor");
 
     // --- Step 2: Compute CTA-based offset ---
     OpBuilder builder(descLoad);
@@ -194,17 +252,18 @@ struct Transform2CTALoads
 
     // New N-dimension index = original + CTA offset.
     SmallVector<Value> newIndices(descLoad.getIndices());
-    newIndices.back() =
-        arith::AddIOp::create(builder, loc, newIndices.back(), offset);
+    newIndices[splitDim] =
+        arith::AddIOp::create(builder, loc, newIndices[splitDim], offset);
 
     // --- Step 3: Create new DescriptorLoadOp with half-width result ---
     auto origResultType =
         cast<RankedTensorType>(descLoad.getResult().getType());
     auto origEncoding =
         cast<ttg::BlockedEncodingAttr>(origResultType.getEncoding());
-    auto newEncoding = getCompatibleEncoding(origEncoding, blockK, halfN, ctx);
+    auto newEncoding =
+        getCompatibleEncoding(origEncoding, newBlockShape, splitDim, ctx);
     auto halfResultType =
-        RankedTensorType::get({blockK, halfN}, elemType, newEncoding);
+        RankedTensorType::get(newBlockShape, elemType, newEncoding);
 
     auto newDescLoad = tt::DescriptorLoadOp::create(
         builder, loc, halfResultType, newDesc, newIndices);
@@ -212,21 +271,44 @@ struct Transform2CTALoads
     // without complex value tracing through pipeline buffers.
     newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());
 
-    LDBG("Created half-width load: " << blockK << "x" << halfN);
+    LDBG("Created half-width load");
 
     // --- Step 4: Create new LocalAllocOp with half-width SMEM ---
+    Value allocSrc = newDescLoad.getResult();
+    if (trans) {
+      builder.setInsertionPoint(localAlloc);
+      allocSrc = tt::TransOp::create(builder, trans.getLoc(), allocSrc,
+                                     trans.getOrder());
+    }
+
     auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
+    auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
     auto newMemDescType = ttg::MemDescType::get(
-        {blockK, halfN}, elemType, origMemDescType.getEncoding(),
+        allocSrcType.getShape(), elemType, origMemDescType.getEncoding(),
         origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
-    auto newLocalAlloc = ttg::LocalAllocOp::create(
-        builder, localAlloc.getLoc(), newMemDescType, newDescLoad.getResult());
+    auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
+                                                   newMemDescType, allocSrc);
 
     // --- Step 5: Replace uses and clean up ---
-    localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());
-    localAlloc.erase();
+    if (memDescTrans) {
+      auto newMemDescTrans = ttg::MemDescTransOp::create(
+          builder, memDescTrans.getLoc(), newLocalAlloc.getResult(),
+          memDescTrans.getOrder());
+      newMemDescTrans->setAttrs(memDescTrans->getAttrs());
+      memDescTrans.getResult().replaceAllUsesWith(newMemDescTrans.getResult());
+      memDescTrans.erase();
+      if (localAlloc.getResult().use_empty())
+        localAlloc.erase();
+    } else {
+      localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());
+      localAlloc.erase();
+    }
+
+    // Clean up old transpose if no other users.
+    if (trans && trans.getResult().use_empty())
+      trans.erase();
 
     // Clean up old descriptor_load if no other users.
     if (descLoad.getResult().use_empty())

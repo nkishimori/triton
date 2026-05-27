@@ -47,6 +47,68 @@ namespace mlir {
 
 namespace {
 
+static Value castToI64(OpBuilder &builder, Location loc, Value value) {
+  auto i64Ty = builder.getI64Type();
+  Type type = value.getType();
+  if (type.isIndex())
+    return arith::IndexCastOp::create(builder, loc, i64Ty, value);
+  auto intTy = dyn_cast<IntegerType>(type);
+  assert(intTy && "expected index or integer loop value");
+  unsigned width = intTy.getWidth();
+  if (width == 64)
+    return value;
+  if (width < 64)
+    return arith::ExtUIOp::create(builder, loc, i64Ty, value);
+  return arith::TruncIOp::create(builder, loc, i64Ty, value);
+}
+
+static Value computeLoopIterIndex(OpBuilder &builder, Location loc,
+                                  scf::ForOp forOp) {
+  Value iv = forOp.getInductionVar();
+  Value lb = forOp.getLowerBound();
+  Value step = forOp.getStep();
+  Value offset = arith::SubIOp::create(builder, loc, iv, lb);
+  Value iterIdx = arith::DivUIOp::create(builder, loc, offset, step);
+  return castToI64(builder, loc, iterIdx);
+}
+
+static Value computeLoopTripCount(OpBuilder &builder, Location loc,
+                                  scf::ForOp forOp) {
+  Value lb = forOp.getLowerBound();
+  Value ub = forOp.getUpperBound();
+  Value step = forOp.getStep();
+  Value distance = arith::SubIOp::create(builder, loc, ub, lb);
+  Value one;
+  if (step.getType().isIndex())
+    one = arith::ConstantIndexOp::create(builder, loc, 1);
+  else
+    one = arith::ConstantIntOp::create(
+        builder, loc, 1, cast<IntegerType>(step.getType()).getWidth());
+  Value numerator = arith::AddIOp::create(
+      builder, loc, distance, arith::SubIOp::create(builder, loc, step, one));
+  Value tripCount = arith::DivUIOp::create(builder, loc, numerator, step);
+  return castToI64(builder, loc, tripCount);
+}
+
+static Value computeLinearizedLoopPhase(OpBuilder &builder, Location loc,
+                                        scf::ForOp forOp) {
+  Value linearIter = computeLoopIterIndex(builder, loc, forOp);
+  Value stride = computeLoopTripCount(builder, loc, forOp);
+  for (auto parentFor = forOp->getParentOfType<scf::ForOp>(); parentFor;
+       parentFor = parentFor->getParentOfType<scf::ForOp>()) {
+    Value parentIter = computeLoopIterIndex(builder, loc, parentFor);
+    Value scaledParent =
+        arith::MulIOp::create(builder, loc, parentIter, stride);
+    linearIter = arith::AddIOp::create(builder, loc, scaledParent, linearIter);
+    Value parentTripCount = computeLoopTripCount(builder, loc, parentFor);
+    stride = arith::MulIOp::create(builder, loc, stride, parentTripCount);
+  }
+
+  Value two = arith::ConstantIntOp::create(builder, loc, 2, 64);
+  Value rem = arith::RemUIOp::create(builder, loc, linearIter, two);
+  return arith::TruncIOp::create(builder, loc, builder.getI32Type(), rem);
+}
+
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
@@ -86,23 +148,7 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc) {
   // WaitBarrierOp expects I32 for the phase parameter.
   Value phase;
   if (auto forOp = mma->getParentOfType<scf::ForOp>()) {
-    // Compute iteration index: (iv - lb) / step, then phase = iter % 2.
-    // Division by step ensures correct alternation for non-unit steps.
-    Value iv = forOp.getInductionVar();
-    Value lb = forOp.getLowerBound();
-    Value offset = arith::SubIOp::create(builder, loc, iv, lb);
-    Value step = forOp.getStep();
-    Value iterIdx = arith::DivUIOp::create(builder, loc, offset, step);
-
-    if (iv.getType().isIndex()) {
-      Value twoIV = arith::ConstantIndexOp::create(builder, loc, 2);
-      Value rem = arith::RemUIOp::create(builder, loc, iterIdx, twoIV);
-      phase = arith::IndexCastOp::create(builder, loc, i32Ty, rem);
-    } else {
-      Value twoIV = arith::ConstantIntOp::create(
-          builder, loc, 2, cast<IntegerType>(iv.getType()).getWidth());
-      phase = arith::RemUIOp::create(builder, loc, iterIdx, twoIV);
-    }
+    phase = computeLinearizedLoopPhase(builder, loc, forOp);
   } else {
     phase = arith::ConstantIntOp::create(builder, loc, 0, 32);
   }
@@ -336,7 +382,7 @@ void doInsert2CTASync(triton::FuncOp funcOp) {
 
     // MMA is in a partition region (IsolatedFromAbove): add explicit capture.
     auto partOp = wsOp.getPartitionOp();
-        partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
+    partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
     Value capturedBarrier;
     for (Region *region : wsOp.getPartitionRegions()) {
       BlockArgument arg = region->addArgument(barrierAlloc.getType(), loc);

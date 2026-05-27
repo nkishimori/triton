@@ -461,39 +461,32 @@ private:
       return success();
     }
 
-    // Find all bar init ops
-    SetVector<Operation *> remoteOrLocalBarInitOps;
-    mod.walk([&](ttng::InitBarrierOp barInitOp) {
-      remoteOrLocalBarInitOps.insert(barInitOp);
+    // Find the kernel entry block and collect entry-block barrier inits.
+    // Only entry-block barriers need the cluster fence+sync for cross-CTA
+    // visibility. Barriers inside WS partition bodies are local pipeline
+    // barriers that don't participate in cross-CTA communication.
+    triton::FuncOp funcOp = nullptr;
+    mod.walk([&](triton::FuncOp op) {
+      if (triton::isKernel(op)) {
+        funcOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     });
+    assert(funcOp && "Expecting to find a kernel func.");
+    Block *entryBlock = &funcOp.front();
 
-    // It's almost impossible for a clustered kernel to not have any mbar but
-    // have 2cta TMEM allocation. We enforce that such that we know it's safe
-    // to insert a cluster sync after the last bar init op, as long as we can
-    // enforce tmem alloc happens after all such mbar init.
-    assert(!remoteOrLocalBarInitOps.empty() &&
-           "Failed to find bar init op in a clustered kernel");
-
-    // Enforcing front end for 2cta kernels:
-    // All mbarrier init and tmem alloc ops need to happen at the first block of
-    // function. This is to make 2cta cluster sync insertion easier
-    if (failed(ensureEarlyBarInit(mod, remoteOrLocalBarInitOps))) {
-      return failure();
-    }
-
-    // Follow the program order and identify the last bar init op.
-    // This is based on the assumption that all bar init happens at the first
-    // block of the kernel func op, as we currently enforce earlier in this
-    // pass. If that assumption changes, we should revisit this heuristic here.
     ttng::InitBarrierOp lastBarInitOp;
-    auto firstBlock = remoteOrLocalBarInitOps.front()->getBlock();
-    for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
+    for (auto it = entryBlock->rbegin(), e = entryBlock->rend(); it != e;
          ++it) {
-      if (remoteOrLocalBarInitOps.contains(&*it)) {
+      if (isa<ttng::InitBarrierOp>(*it)) {
         lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
         break;
       }
     }
+
+    if (!lastBarInitOp)
+      return success();
 
     OpBuilder builder(lastBarInitOp);
     builder.setInsertionPointAfter(lastBarInitOp);

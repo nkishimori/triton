@@ -583,7 +583,7 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
       if (isa<triton::gpu::WarpSpecializeOp>(op))
         hasWarpSpecialize = true;
     });
-    if (twoCTAs || tlxPairedMMA && !hasWarpSpecialize) {
+    if ((twoCTAs || tlxPairedMMA) && !hasWarpSpecialize) {
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
       if (tlxPairedMMA) {

@@ -359,7 +359,7 @@ void OptimizePartitionWarps::runOnOperation() {
     // The module must be directly nested under the current op for `runPipeline`
     // to work.
     getOperation().push_back(container);
-    llvm::scope_exit remove([&] { container->remove(); });
+    auto remove = llvm::make_scope_exit([&] { container->remove(); });
     return runPipeline(pm, container);
   };
 
