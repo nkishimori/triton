@@ -560,17 +560,19 @@ public:
       auto mod = dotOp->getParentOfType<ModuleOp>();
       auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
       if (clusterDims[0] < 2) {
-        return dotOp.emitError(
-            "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
-            "cluster-dim-x is ")
-               << clusterDims[0];
-      }
-      useTwoCTAs = true;
-      auto retShape = oldRetType.getShape();
-      if (retShape[0] < 128) {
-        return dotOp.emitError(
-            "two_ctas=True with BLOCK_M < 128 is not yet supported; "
-            "m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS");
+        dotOp.emitWarning()
+            << "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
+               "cluster-dim-x is "
+            << clusterDims[0] << ". Falling back to 1-CTA MMA.";
+        useTwoCTAs = false;
+      } else if (oldRetType.getShape()[0] < 128) {
+        dotOp.emitWarning()
+            << "two_ctas=True with BLOCK_M < 128 is not yet supported; "
+               "m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS. "
+               "Falling back to 1-CTA MMA.";
+        useTwoCTAs = false;
+      } else {
+        useTwoCTAs = true;
       }
     } else {
       // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a

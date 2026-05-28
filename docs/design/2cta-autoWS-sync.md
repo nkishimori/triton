@@ -153,7 +153,7 @@ matmul_2cta[grid](
 | Configuration | Status |
 |---|---|
 | `two_ctas=True` + `ctas_per_cga=(2,1,1)` | **Supported** |
-| `two_ctas=True` without `ctas_per_cga` | **Error** — no cluster, MMA would be 1-CTA |
+| `two_ctas=True` without `ctas_per_cga` | **Warn + fallback** — no cluster, compiler emits 1-CTA MMA |
 | `two_ctas=True` + `ctas_per_cga=(4,1,1)` | **Future work** — even-X CGA should work in principle |
 | `two_ctas=True` + `ctas_per_cga=(2,2,1)` | **Unsupported** — Y/Z must be 1 |
 | Mixed `two_ctas` per dot in same kernel | **Impossible** — hardware requires all tcgen05 ops use same `cta_group` |
@@ -207,7 +207,13 @@ When `dotOp.getTwoCtas()` is true, AccelerateMatmul takes the user-driven path:
 if (dotOp.getTwoCtas()) {
     // User-driven 2-CTA (ctas_per_cga): no splitBOperand needed.
     // Transform2CTALoads will handle B splitting later.
-    useTwoCTAs = true;
+    if (clusterDimX < 2 || blockM < 128) {
+        // Unsupported or unsafe for the current compiler implementation.
+        // Warn and lower as a normal 1-CTA MMA instead of failing compilation.
+        useTwoCTAs = false;
+    } else {
+        useTwoCTAs = true;
+    }
 } else {
     // Compiler-driven 2-CTA (PlanCTA heuristic): split B at IR level.
     useTwoCTAs = canUseTwoCTAs(dotOp);
@@ -457,10 +463,15 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    hardware. A future optimization could use this on B-operand TMA loads,
    potentially eliminating the explicit cross-CTA sync.
 
-7. **Even `num_tiles` requirement**: In 2-CTA mode, CTAs launch in pairs. If
-   `num_tiles` is odd, the last CTA has no partner, which could cause a hang on
-   the cross-CTA barrier or produce incorrect results. TLX kernels filter configs
-   manually for this. The compiler does not currently enforce this constraint.
+7. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
+   pairs and the paired CTAs must map to compatible logical tiles. For the
+   persistent matmul schedule used in the addmm repro, the CTA pair must stay on
+   the same `pid_n` and cover adjacent `pid_m` tiles, so an odd `grid_m` must be
+   padded to an even value. Otherwise, the final pair can cross an N-tile
+   boundary and break the B-sharing contract. The compiler currently cannot
+   prove arbitrary user tile schedulers are pair-aligned; a future diagnostic
+   should recognize supported scheduler patterns and warn/fallback to 1-CTA when
+   pair alignment cannot be established.
 
 8. **CGA sizes beyond `(2,1,1)`**: `two_ctas=True` should be compatible with any
    even-sized CGA-X (e.g., `ctas_per_cga=(4,1,1)`) in the future. Requiring
@@ -472,8 +483,8 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
 
 10. **BLOCK_M < 128 not supported**: When `BLOCK_M < 128`, the TMEM instruction
     shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS`/`TwoCTA_RHS`
-    instead of `DEFAULT`. The compiler currently emits an error if
-    `two_ctas=True` with `BLOCK_M < 128`.
+    instead of `DEFAULT`. The compiler currently emits a warning and falls back
+    to 1-CTA MMA if `two_ctas=True` with `BLOCK_M < 128`.
 
 ---
 
