@@ -216,9 +216,8 @@ public:
     poisonUnhandledCase(operand);
   }
 
-  void
-  visitNonControlFlowArguments(RegionSuccessor &successor,
-                               ArrayRef<BlockArgument> arguments) {}
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) {}
   void setToExitState(DotRewriteLattice *lattice) override {}
 
 private:
