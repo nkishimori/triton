@@ -436,55 +436,99 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
 
 ## Known Limitations and Future Work
 
-1. **Single barrier for phase tracking**: Uses `phase = (iv - lb) % 2` with one
-   barrier. Works for pipeline depth <= 2; may need multi-buffered barriers for
-   deeper pipelines.
+### Current Limitations
 
-2. **Multiple MMAs per loop iteration**: Only one 2-CTA MMA per loop iteration is
-   supported. Multiple MMAs would require separate barriers (one per MMA) to avoid
-   phase conflicts. The compiler asserts if multiple 2-CTA MMAs are detected in
-   the same loop. FA support is future work.
+1. **Single 2-CTA MMA per loop iteration**: Multiple 2-CTA MMAs in the same loop
+   would require separate cross-CTA barriers to avoid phase conflicts. The
+   compiler currently asserts if multiple 2-CTA MMAs are detected in the same
+   loop. FA-style multi-MMA loops are future work.
 
-3. **TCGen5MMAScaledOp**: Only `TCGen5MMAOp` is handled; the scaled variant is
-   not yet supported.
+2. **Single barrier for phase tracking**: `Insert2CTASync` uses one barrier with
+   `phase = (iv - lb) % 2`. This is enough for the current pipeline pattern, but
+   deeper or more complex pipelines may need multi-buffered cross-CTA barriers.
 
-4. **B from function arguments**: `Transform2CTALoads` supports both device-side
-   TMA (`MakeTensorDescOp`) and host-side TMA (function argument descriptors).
-   For host-side descriptors, the pass updates the argument's `TensorDescType`
-   to half-width block shape; the runtime reads the final IR type via
-   `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
-
-5. **Encoding compatibility**: When halving the N dimension, the blocked encoding
-   on the descriptor load result may need adjustment. The pass computes a
-   compatible encoding by reducing `threadsPerWarp` in the N dimension.
-
-6. **D96323995's `.cta_group::2` on TMA loads**: D96323995 added `.cta_group::2`
-   support for TMA loads, which routes barrier arrivals to the leader CTA in
-   hardware. A future optimization could use this on B-operand TMA loads,
-   potentially eliminating the explicit cross-CTA sync.
-
-7. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
+3. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
    pairs and the paired CTAs must map to compatible logical tiles. For the
    persistent matmul schedule used in the addmm repro, the CTA pair must stay on
    the same `pid_n` and cover adjacent `pid_m` tiles, so an odd `grid_m` must be
    padded to an even value. Otherwise, the final pair can cross an N-tile
    boundary and break the B-sharing contract. The compiler currently cannot
-   prove arbitrary user tile schedulers are pair-aligned; a future diagnostic
-   should recognize supported scheduler patterns and warn/fallback to 1-CTA when
-   pair alignment cannot be established.
+   prove arbitrary user tile schedulers are pair-aligned.
 
-8. **CGA sizes beyond `(2,1,1)`**: `two_ctas=True` should be compatible with any
-   even-sized CGA-X (e.g., `ctas_per_cga=(4,1,1)`) in the future. Requiring
-   Y/Z == 1 is reasonable. Extending beyond `(2,1,1)` is future work.
+4. **`BLOCK_M < 128` falls back to 1-CTA**: When `BLOCK_M < 128`, the TMEM
+   instruction shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS` or
+   `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`. The compiler currently
+   emits a warning and falls back to 1-CTA MMA if `two_ctas=True` with
+   `BLOCK_M < 128`.
 
-9. **Mixed 2-CTA per kernel**: The PTX ISA requires all tcgen05 instructions use
-   the same `cta_group`. FA with selective 2-CTA on only some dots is impossible.
-   A kernel must use 2-CTA on all dots or none.
+5. **`TCGen5MMAScaledOp` is not handled by the load transform**: The current
+   `Transform2CTALoads` implementation handles `TCGen5MMAOp`. The scaled variant
+   still needs explicit support before scaled MMA can use this 2-CTA path.
 
-10. **BLOCK_M < 128 not supported**: When `BLOCK_M < 128`, the TMEM instruction
-    shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS`/`TwoCTA_RHS`
-    instead of `DEFAULT`. The compiler currently emits a warning and falls back
-    to 1-CTA MMA if `two_ctas=True` with `BLOCK_M < 128`.
+6. **Mixed 2-CTA per kernel is impossible**: The PTX ISA requires all tcgen05
+   instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
+   on only some dots is impossible; a kernel must use 2-CTA on all dots or none.
+
+7. **Host-side TMA descriptor shape is updated through IR type metadata**:
+   `Transform2CTALoads` supports host-side TMA by updating the function argument's
+   `TensorDescType` to half-width block shape. The runtime reads that final IR
+   type via `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
+   We still need to confirm that `CuTensorMap` has no separate descriptor-side
+   `cta_group::2` flag; current usage relies on the PTX load instruction
+   qualifier, not descriptor metadata.
+
+8. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
+   WS + 2-CTA test kernels must use descriptor/TMA stores for the output. Pointer
+   stores do not currently create the expected epilogue partition.
+
+### Future Work
+
+1. **Unify 2-CTA detection**: 2-CTA mode is currently detected through a mix of
+   `TCGen5MMAOp::getTwoCtas()`, module attribute `ttng.two-ctas`, cluster
+   dimensions, `num_ctas`, `ctas_per_cga`, and TLX-specific helpers. Add one
+   authoritative helper and audit fragmented check sites so future cherry-picks
+   do not accidentally miss the `ctas_per_cga` path.
+
+2. **Add scheduler safety diagnostics**: Recognize supported pair-aligned
+   program-id schedules, or warn/fallback to 1-CTA when pair alignment cannot be
+   established.
+
+3. **Support `BLOCK_M < 128`**: Plumb the required
+   `TensorMemoryCTAMode::TwoCTA_LHS` / `TwoCTA_RHS` mode for the m=64
+   instruction shape instead of falling back to 1-CTA.
+
+4. **Verify all WS commit paths**: Confirm that `TCGen5CommitOp` has the correct
+   `cta_group` behavior in every Auto-WS path, including reuse-group and fused
+   commit cases.
+
+5. **Close hardware synchronization confirmations**: Confirm that
+   `tcgen05.commit.cta_group::2` guarantees both CTAs' SMEM inputs are consumed
+   before the completion arrive-on fires, and confirm that A/B shared-barrier
+   expected byte counts remain correct after B is split half-width per CTA.
+
+6. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
+   support for TMA loads, which routes barrier arrivals to the leader CTA in
+   hardware. A future optimization could use this on B-operand TMA loads and
+   potentially eliminate the explicit cross-CTA sync inserted by `Insert2CTASync`.
+
+7. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
+   larger even-sized CGA-X shapes such as `ctas_per_cga=(4,1,1)`. Requiring
+   Y/Z == 1 is reasonable, but extending beyond `(2,1,1)` remains future work.
+
+8. **Improve diagnostics**: Replace internal asserts for unsupported multi-MMA
+   loop patterns with user-facing compiler diagnostics if those cases can be
+   reached from normal user code.
+
+9. **Improve pointer-store epilogue support**: Either expand Meta WS
+   `isEpilogueStoreOp` to recognize pointer stores, or handle the same-partition
+   producer case gracefully.
+
+10. **Re-verify TLX fixes with Auto-WS**: Re-run the shared TLX 2-CTA fix matrix
+    against Triton + Auto-WS after this branch settles.
+
+11. **Resolve `clearLoopScheduleInfo()` intent**: The code is documented for the
+    intentional case, but the original question should still be closed with the
+    owner or reverted if the movement was accidental.
 
 ---
 
