@@ -18,6 +18,7 @@ from triton.runtime.errors import PTXASError
 
 
 def min_dot_size(target: GPUTarget):
+
     def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:  # [m, n, k]
         lhs_bitwidth = lhs_type.scalar.primitive_bitwidth
         rhs_bitwidth = rhs_type.scalar.primitive_bitwidth
@@ -197,8 +198,7 @@ class CUDAOptions:
             # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
             assert self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga, (
                 f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}"
-            )
+                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
 
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
@@ -247,18 +247,13 @@ class CUDABackend(BaseBackend):
         capability = int(self._parse_arch(args["arch"]))
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
-            raise ValueError(
-                (
-                    f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
-                    f"Current target is sm_{capability}. This configuration will fail. "
-                    f"Please set num_ctas=1 or target an SM90+ GPU."
-                )
-            )
+            raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
+                              f"Current target is sm_{capability}. This configuration will fail. "
+                              f"Please set num_ctas=1 or target an SM90+ GPU."))
 
         if args.get("preferred_ctas_per_cga") is not None and capability < 100:
             raise ValueError(
-                (f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). Current target is sm_{capability}.")
-            )
+                (f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). Current target is sm_{capability}."))
 
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
@@ -268,7 +263,7 @@ class CUDABackend(BaseBackend):
 
         if "deprecated_fp8_dot_operand_dtypes" not in args:
             if capability >= 90:
-                args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15",)
+                args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15", )
 
         if "enable_fp_fusion" not in args:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
@@ -316,13 +311,13 @@ class CUDABackend(BaseBackend):
         for k in constants:
             if isinstance(k, str):
                 if hasattr(src, "fn"):
-                    constant_keys.add((src.fn.arg_names.index(k),))
+                    constant_keys.add((src.fn.arg_names.index(k), ))
                 else:
-                    constant_keys.add((k,))
+                    constant_keys.add((k, ))
             elif isinstance(k, tuple):
                 constant_keys.add(k)
             else:
-                constant_keys.add((k,))
+                constant_keys.add((k, ))
 
         attrs = getattr(src, "attrs", {})
         arg_names = src.fn.arg_names if hasattr(src, "fn") else None
@@ -330,14 +325,14 @@ class CUDABackend(BaseBackend):
         args = []
         for idx, (key, ty) in enumerate(src.signature.items()):
             # Skip compile-time constants — they go in the "constants" dict.
-            if (idx,) in constant_keys:
+            if (idx, ) in constant_keys:
                 continue
 
             name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
             arg_entry = {"name": name, "type": str(ty), "index": idx}
 
             # Check for tt.divisibility attribute.
-            attr_specs = attrs.get((idx,), [])
+            attr_specs = attrs.get((idx, ), [])
             for attr_name, attr_val in attr_specs:
                 if attr_name == "tt.divisibility":
                     arg_entry["divisible_by"] = attr_val
@@ -435,10 +430,8 @@ class CUDABackend(BaseBackend):
             if c_ty is None:
                 # Unknown type — skip launcher generation so compilation
                 # isn't blocked by types we haven't mapped yet.
-                warnings.warn(
-                    f"Unknown Triton type '{triton_ty}' in launcher codegen, "
-                    f"skipping launcher generation. Add it to _TYPE_TO_C in make_launcher_src()."
-                )
+                warnings.warn(f"Unknown Triton type '{triton_ty}' in launcher codegen, "
+                              f"skipping launcher generation. Add it to _TYPE_TO_C in make_launcher_src().")
                 return None
             return c_ty
 
@@ -548,9 +541,8 @@ class CUDABackend(BaseBackend):
 
         capability = int(self._parse_arch(options.arch))
         codegen_fns = {
-            "convert_custom_types": cuda.convert_custom_float8_sm80
-            if capability >= 80
-            else cuda.convert_custom_float8_sm70,
+            "convert_custom_types":
+            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70,
             "min_dot_size": min_dot_size(self.target),
         }
         return codegen_fns
@@ -577,9 +569,8 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas, list(opt.cluster_dims)
-        )
+        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas,
+                                            list(opt.cluster_dims))
         passes.common.add_inliner(pm)
         # Handle storage lowering. In the future this may need
         # dummy layouts
@@ -653,12 +644,8 @@ class CUDABackend(BaseBackend):
         # (num_ctas=1), so Transform2CTALoads is the only B splitting path.
         # Cross-CTA sync is handled separately: Insert2CTASync for Meta WS,
         # MMAv5.cpp's inline ClusterArriveOp for non-WS.
-        if (
-            capability // 10 >= 10
-            and opt.cluster_dims is not None
-            and max(opt.cluster_dims) >= 2
-            and opt.ctas_per_cga is not None
-        ):
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -678,9 +665,8 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-            nvidia.passes.hopper.add_hopper_warpspec(
-                pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled, smem_budget, generate_subtiled
-            )
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
+                                                     smem_budget, generate_subtiled)
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
@@ -721,9 +707,8 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
-                nvidia.passes.hopper.add_hopper_warpspec(
-                    pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled, smem_budget, generate_subtiled
-                )
+                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
+                                                         dump_enabled, smem_budget, generate_subtiled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -777,9 +762,8 @@ class CUDABackend(BaseBackend):
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
-        metadata["preferred_ctas_per_cga"] = (
-            tuple(opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
-        )
+        metadata["preferred_ctas_per_cga"] = (tuple(opt.preferred_ctas_per_cga)
+                                              if opt.preferred_ctas_per_cga is not None else None)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -883,8 +867,7 @@ class CUDABackend(BaseBackend):
         context = llvm.context()
         if knobs.compilation.enable_asan:
             raise RuntimeError(
-                "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend"
-            )
+                "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
         llvm_mod = llvm.to_module(mod, context)
         proc = sm_arch_from_capability(capability)
         features = get_features(options, self.target.arch)
@@ -945,8 +928,8 @@ class CUDABackend(BaseBackend):
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas(self.target.arch).path
         with (
-            tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
-            tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
+                tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
+                tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
         ):
             fsrc.write(src)
             fsrc.flush()

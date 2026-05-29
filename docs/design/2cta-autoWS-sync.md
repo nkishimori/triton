@@ -473,13 +473,51 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    `Transform2CTALoads` supports host-side TMA by updating the function argument's
    `TensorDescType` to half-width block shape. The runtime reads that final IR
    type via `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
-   We still need to confirm that `CuTensorMap` has no separate descriptor-side
-   `cta_group::2` flag; current usage relies on the PTX load instruction
-   qualifier, not descriptor metadata.
+   The `cta_group::2` mode is carried by the PTX instruction qualifier, not a
+   separate descriptor-side flag.
 
 8. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
    WS + 2-CTA test kernels must use descriptor/TMA stores for the output. Pointer
    stores do not currently create the expected epilogue partition.
+
+### Verified Non-Future Items
+
+1. **WS commit paths use the correct `cta_group`**: `TCGen5CommitOp` does not
+   carry its own 2-CTA attribute. Its LLVM lowering queries the module
+   `ttng.two-ctas` attribute and emits `tcgen05.commit.cta_group::2` with the
+   leader-CTA predicate when the module contains 2-CTA MMA ops. This covers
+   commit ops created by Auto-WS paths, including fused commits, because the
+   conversion is module-level.
+
+2. **Commit completion semantics are sufficient for B-empty signaling**:
+   `TCGen5CommitOp` is defined to make an mbarrier track completion of all prior
+   async tcgen05 operations, with completion mechanisms ordered by commit issue
+   order. For a prior `tcgen05.mma.cta_group::2`, this means the local WS
+   `b_empty` signal is issued only after the 2-CTA MMA has completed.
+
+3. **A/B shared-barrier byte counts use half-width B**: `Transform2CTALoads`
+   rewrites the B `DescriptorLoadOp` to a half-width result type before Auto-WS
+   lowers TMA loads. `WSLowerMem` computes `BarrierExpectOp` byte counts from
+   the descriptor-load result type, so any shared A/B barrier sees the
+   half-width B size.
+
+4. **Host-side TMA descriptors work with the same mechanism**: Host-side TMA
+   descriptor arguments have their `TensorDescType` updated to the half-width
+   block type. The runtime consumes that final IR type when creating the
+   `CuTensorMap`; no separate descriptor-side 2-CTA flag is required for the
+   tested path.
+
+5. **TLX/Auto-WS fix matrix has been re-verified for current coverage**: The
+   focused non-performance 2-CTA Python test suite passes for non-WS, Auto-WS,
+   host-side TMA, and host-side TMA + Auto-WS cases. The focused MLIR checks for
+   B-load splitting, cross-CTA sync insertion, and Blackwell LLVM lowering also
+   pass.
+
+6. **`clearLoopScheduleInfo()` placement is not a future feature**: The
+   `replaceCommitWithBarrierSync` path is currently disabled, so the current
+   implementation always follows the normal commit creation path and clears loop
+   schedule info immediately after creating the commit. If commit replacement is
+   re-enabled, its schedule-info handling should be revisited with that change.
 
 ### Future Work
 
@@ -490,45 +528,39 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    do not accidentally miss the `ctas_per_cga` path.
 
 2. **Add scheduler safety diagnostics**: Recognize supported pair-aligned
-   program-id schedules, or warn/fallback to 1-CTA when pair alignment cannot be
-   established.
+   program-id schedules, including the current M-paired persistent matmul
+   schedule where odd `grid_m` must be padded. If pair alignment cannot be
+   established, warn and fall back to 1-CTA instead of compiling an unsafe 2-CTA
+   kernel.
 
 3. **Support `BLOCK_M < 128`**: Plumb the required
    `TensorMemoryCTAMode::TwoCTA_LHS` / `TwoCTA_RHS` mode for the m=64
    instruction shape instead of falling back to 1-CTA.
 
-4. **Verify all WS commit paths**: Confirm that `TCGen5CommitOp` has the correct
-   `cta_group` behavior in every Auto-WS path, including reuse-group and fused
-   commit cases.
-
-5. **Close hardware synchronization confirmations**: Confirm that
-   `tcgen05.commit.cta_group::2` guarantees both CTAs' SMEM inputs are consumed
-   before the completion arrive-on fires, and confirm that A/B shared-barrier
-   expected byte counts remain correct after B is split half-width per CTA.
-
-6. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
+4. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
    support for TMA loads, which routes barrier arrivals to the leader CTA in
    hardware. A future optimization could use this on B-operand TMA loads and
    potentially eliminate the explicit cross-CTA sync inserted by `Insert2CTASync`.
 
-7. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
+5. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
    larger even-sized CGA-X shapes such as `ctas_per_cga=(4,1,1)`. Requiring
    Y/Z == 1 is reasonable, but extending beyond `(2,1,1)` remains future work.
 
-8. **Improve diagnostics**: Replace internal asserts for unsupported multi-MMA
+6. **Improve diagnostics**: Replace internal asserts for unsupported multi-MMA
    loop patterns with user-facing compiler diagnostics if those cases can be
    reached from normal user code.
 
-9. **Improve pointer-store epilogue support**: Either expand Meta WS
+7. **Improve pointer-store epilogue support**: Either expand Meta WS
    `isEpilogueStoreOp` to recognize pointer stores, or handle the same-partition
    producer case gracefully.
 
-10. **Re-verify TLX fixes with Auto-WS**: Re-run the shared TLX 2-CTA fix matrix
-    against Triton + Auto-WS after this branch settles.
-
-11. **Resolve `clearLoopScheduleInfo()` intent**: The code is documented for the
-    intentional case, but the original question should still be closed with the
-    owner or reverted if the movement was accidental.
+8. **Evaluate the `BtAt` transposed-matmul trick**: The current `AB` 2-CTA path
+   pairs CTAs along original output rows: same `pid_n`, adjacent `pid_m`.
+   Computing `AB` as `(B^T A^T)^T` would transpose the logical output tile grid,
+   so the safe pairing would need to become same original `pid_m`, adjacent
+   original `pid_n`. `Transform2CTALoads` already maps the B split dimension
+   through simple transpose ops, but the scheduler/cluster pairing contract and
+   tests for this variant remain future work.
 
 ---
 

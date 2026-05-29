@@ -30,7 +30,6 @@ Debugging:
 
 import os
 from contextlib import contextmanager
-from typing import Optional
 
 import pytest
 import torch
@@ -38,9 +37,10 @@ import triton
 import triton.language as tl
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     tcgen5_dot_kernel2cta_tma as _tlx_2cta_kernel, )
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
-def alloc_fn(size: int, align: int, stream: Optional[int]):
+def alloc_fn(size: int, align: int, stream: int | None):
     return torch.empty(size, dtype=torch.int8, device="cuda")
 
 
@@ -504,8 +504,6 @@ def test_matmul_2cta_perf(M, N, K):
 # ---------------------------------------------------------------------------
 # Host-side TMA + 2-CTA tests
 # ---------------------------------------------------------------------------
-
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 @triton.jit

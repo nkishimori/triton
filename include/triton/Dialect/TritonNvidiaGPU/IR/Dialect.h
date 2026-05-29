@@ -70,8 +70,8 @@ inline bool getModuleTwoCTAs(Operation *op) {
 
 /// Check if any cluster dimension >= 2 (2-CTA mode).
 inline bool is2CTA(ModuleOp mod) {
-  for (auto name : {"ttg.cluster-dim-x", "ttg.cluster-dim-y",
-                    "ttg.cluster-dim-z"}) {
+  for (auto name :
+       {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
     if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
       if (attr.getInt() >= 2)
         return true;
