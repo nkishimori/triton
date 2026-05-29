@@ -306,7 +306,6 @@ def NVGPUMultiCTAReduction : Pass<"nvgpu-multi-cta-reduction", "mlir::ModuleOp">
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-
 def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
   let summary = "Insert cross-CTA synchronization for 2-CTA MMA operations";
 
